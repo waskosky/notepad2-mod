@@ -19,7 +19,7 @@
 
 ## Supported Operating Systems:
 
-* XP (SP3, SP2 might or might not work), Vista, 7, 8, 8.1 and 10 both 32-bit and 64-bit
+* Windows 7, 8, 8.1, 10 (32-bit and 64-bit)
 
 ## [Screenshots](https://xhmikosr.github.io/notepad2-mod/screenshots)
 
@@ -49,4 +49,4 @@
 * <kbd>Ctrl+Alt+Shift+F2</kbd> Expand selection to previous match.
 * <kbd>Ctrl+Shift+Enter</kbd>  New line with toggled auto indent option.
 
-You can use MSVC 2017 to build Notepad2-mod.
+You can use Visual Studio 2017+ (Build Tools) to build Notepad2-mod. Toolset: v141; Windows 10 SDK.

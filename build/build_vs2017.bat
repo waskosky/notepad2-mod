@@ -3,8 +3,8 @@ rem ****************************************************************************
 rem *
 rem * Notepad2-mod
 rem *
-rem * build_vs2015.bat
-rem *   Batch file used to build Notepad2 with MSVC2015
+rem * build_vs2017.bat
+rem *   Batch file used to build Notepad2 with Visual Studio 2017+
 rem *
 rem * See License.txt for details about distribution and modification.
 rem *
@@ -100,14 +100,14 @@ IF "%~3" == "" (
 
 :START
 CALL :SubVSPath
-IF NOT EXIST "%VS_PATH%" CALL :SUBMSG "ERROR" "Visual Studio 2017 NOT FOUND!"
+IF NOT EXIST "%VS_PATH%" CALL :SUBMSG "ERROR" "Visual Studio Build Tools NOT FOUND!"
 
 IF /I "%ARCH%" == "x64" GOTO x64
 IF /I "%ARCH%" == "x86" GOTO x86
 
 
 :x86
-CALL "%VS_PATH%\Common7\Tools\vsdevcmd" -no_logo -arch=x86
+CALL "%VS_PATH%\Common7\Tools\vsdevcmd.bat" -no_logo -arch=x86
 
 IF /I "%CONFIG%" == "all" (CALL :SUBMSVC %BUILDTYPE% Debug Win32 && CALL :SUBMSVC %BUILDTYPE% Release Win32) ELSE (CALL :SUBMSVC %BUILDTYPE% %CONFIG% Win32)
 
@@ -115,13 +115,13 @@ IF /I "%ARCH%" == "x86" GOTO END
 
 
 :x64
-CALL "%VS_PATH%\Common7\Tools\vsdevcmd" -no_logo -arch=amd64
+CALL "%VS_PATH%\Common7\Tools\vsdevcmd.bat" -no_logo -arch=amd64
 
 IF /I "%CONFIG%" == "all" (CALL :SUBMSVC %BUILDTYPE% Debug x64 && CALL :SUBMSVC %BUILDTYPE% Release x64) ELSE (CALL :SUBMSVC %BUILDTYPE% %CONFIG% x64)
 
 
 :END
-TITLE Building Notepad2-mod with MSVC2015 - Finished!
+TITLE Building Notepad2-mod with MSVC2017+ - Finished!
 ENDLOCAL
 EXIT /B
 
@@ -134,7 +134,7 @@ EXIT /B
 
 :SUBMSVC
 ECHO.
-TITLE Building Notepad2-mod with MSVC2015 - %~1 "%~2|%~3"...
+TITLE Building Notepad2-mod with MSVC2017+ - %~1 "%~2|%~3"...
 "MSBuild.exe" /nologo Notepad2.sln /t:%~1 /p:Configuration=%~2;Platform=%~3^
  /consoleloggerparameters:Verbosity=minimal /maxcpucount /nodeReuse:true
 IF %ERRORLEVEL% NEQ 0 CALL :SUBMSG "ERROR" "Compilation failed!"
