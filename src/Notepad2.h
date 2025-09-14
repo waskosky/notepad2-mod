@@ -95,6 +95,14 @@ typedef struct np2params {
 #define REUSEWINDOWLOCKTIMEOUT 1000
 
 
+//==== Sound Control ==========================================================
+// Silence all beeps/sounds by default. Define NP2_ENABLE_SOUNDS to allow beeps.
+#ifndef NP2_ENABLE_SOUNDS
+#undef MessageBeep
+#define MessageBeep(...) ((void)0)
+#endif
+
+
 //==== Function Declarations ==================================================
 BOOL InitApplication(HINSTANCE);
 HWND InitInstance(HINSTANCE,LPSTR,int);

@@ -28,6 +28,12 @@
 #include <commdlg.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#ifndef RGB
+#define RGB(r,g,b) ((COLORREF)(((BYTE)(r)|((WORD)((BYTE)(g))<<8))|(((DWORD)(BYTE)(b))<<16)))
+#endif
+// Indicator ID used to flag conflicts on external file changes
+#define INDIC_CONFLICT 2
 #include <time.h>
 #include "scintilla.h"
 #include "scilexer.h"
@@ -162,6 +168,11 @@ int       iFileWatchingMode;
 BOOL      bResetFileWatching;
 DWORD     dwFileCheckInverval;
 DWORD     dwAutoReloadTimeout;
+// Enhanced file watching and auto-merge options
+BOOL      bAggressiveAutoReload = TRUE;
+BOOL      bAutoMergeAppends = TRUE;
+static char *g_pBaselineText = NULL;
+static int   g_cbBaselineText = 0;
 int       iEscFunction;
 BOOL      bAlwaysOnTop;
 BOOL      bMinimizeToTray;
@@ -169,6 +180,13 @@ BOOL      bTransparentMode;
 BOOL      bTransparentModeAvailable;
 BOOL      bShowToolbar;
 BOOL      bShowStatusbar;
+
+// Forward declarations for enhanced file watching helpers
+static void CaptureBaselineFromEditor(void);
+static BOOL ReadWholeFileBytes(LPCWSTR path, char **outBuf, int *outLen);
+static BOOL TryAutoMergeAppendsWithRemote(const char *remote, int cbRemote);
+static void ShowConflictIndicatorWithRemote(const char *remote, int cbRemote);
+static void ClearConflictIndicator(void);
 
 typedef struct _wi
 {
@@ -220,6 +238,159 @@ BOOL      bReadOnly = FALSE;
 int       iEncoding;
 int       iOriginalEncoding;
 int       iEOLMode;
+
+// ----------------------------------------------------------------------------
+// Enhanced File Watching Helpers
+// ----------------------------------------------------------------------------
+
+static void ClearConflictIndicator(void)
+{
+  if (!hwndEdit) return;
+  int iTextLen = (int)SendMessage(hwndEdit, SCI_GETLENGTH, 0, 0);
+  SendMessage(hwndEdit, SCI_SETINDICATORCURRENT, INDIC_CONFLICT, 0);
+  SendMessage(hwndEdit, SCI_INDICATORCLEARRANGE, 0, iTextLen);
+}
+
+static void SetupConflictIndicatorStyle(void)
+{
+  // Filled red box under text for highly visible conflict marker
+  SendMessage(hwndEdit, SCI_SETINDICATORCURRENT, INDIC_CONFLICT, 0);
+  SendMessage(hwndEdit, SCI_INDICSETSTYLE, INDIC_CONFLICT, INDIC_FULLBOX);
+  SendMessage(hwndEdit, SCI_INDICSETFORE, INDIC_CONFLICT, RGB(255,0,0));
+  SendMessage(hwndEdit, SCI_INDICSETALPHA, INDIC_CONFLICT, 80);
+}
+
+static void CaptureBaselineFromEditor(void)
+{
+  int len = (int)SendMessage(hwndEdit, SCI_GETLENGTH, 0, 0);
+  char *buf = (char*)malloc(len + 1);
+  if (!buf) return;
+  SendMessage(hwndEdit, SCI_GETTEXT, len + 1, (LPARAM)buf);
+  if (g_pBaselineText) free(g_pBaselineText);
+  g_pBaselineText = buf;
+  g_cbBaselineText = len;
+}
+
+static BOOL ReadWholeFileBytes(LPCWSTR path, char **outBuf, int *outLen)
+{
+  HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (h == INVALID_HANDLE_VALUE) return FALSE;
+  DWORD size = GetFileSize(h, NULL);
+  if (size == INVALID_FILE_SIZE) { CloseHandle(h); return FALSE; }
+  char *buf = (char*)malloc(size + 1);
+  if (!buf) { CloseHandle(h); return FALSE; }
+  DWORD read = 0; BOOL ok = ReadFile(h, buf, size, &read, NULL);
+  CloseHandle(h);
+  if (!ok) { free(buf); return FALSE; }
+  buf[size] = '\0';
+  *outBuf = buf;
+  *outLen = (int)size;
+  return TRUE;
+}
+
+static int FirstDiffOffset(const char *a, int alen, const char *b, int blen)
+{
+  int m = alen < blen ? alen : blen;
+  int i = 0;
+  for (; i < m; ++i) {
+    if (a[i] != b[i]) return i;
+  }
+  if (alen != blen) return m;
+  return -1; // no difference
+}
+
+static void ShowConflictIndicatorWithRemote(const char *remote, int cbRemote)
+{
+  if (!hwndEdit) return;
+
+  int locLen = (int)SendMessage(hwndEdit, SCI_GETLENGTH, 0, 0);
+  char *locBuf = (char*)malloc(locLen + 1);
+  if (!locBuf) return;
+  SendMessage(hwndEdit, SCI_GETTEXT, locLen + 1, (LPARAM)locBuf);
+
+  int off = FirstDiffOffset(locBuf, locLen, remote, cbRemote);
+  free(locBuf);
+  if (off < 0) return;
+
+  SetupConflictIndicatorStyle();
+
+  int line = (int)SendMessage(hwndEdit, SCI_LINEFROMPOSITION, off, 0);
+  int lineStart = (int)SendMessage(hwndEdit, SCI_POSITIONFROMLINE, line, 0);
+  int lineEnd = lineStart + (int)SendMessage(hwndEdit, SCI_LINELENGTH, line, 0);
+
+  SendMessage(hwndEdit, SCI_INDICATORFILLRANGE, lineStart, lineEnd - lineStart);
+}
+
+static BOOL TryAutoMergeAppendsWithRemote(const char *remote, int cbRemote)
+{
+  if (!bAutoMergeAppends) return FALSE;
+  if (!g_pBaselineText || g_cbBaselineText <= 0) return FALSE;
+
+  int locLen = (int)SendMessage(hwndEdit, SCI_GETLENGTH, 0, 0);
+  if (g_cbBaselineText > locLen || g_cbBaselineText > cbRemote) return FALSE;
+
+  char *locBuf = (char*)malloc(locLen + 1);
+  if (!locBuf) return FALSE;
+  SendMessage(hwndEdit, SCI_GETTEXT, locLen + 1, (LPARAM)locBuf);
+
+  BOOL canMerge = FALSE;
+  if (memcmp(g_pBaselineText, locBuf, g_cbBaselineText) == 0 &&
+      memcmp(g_pBaselineText, remote, g_cbBaselineText) == 0) {
+    canMerge = TRUE;
+  }
+
+  if (!canMerge) { free(locBuf); return FALSE; }
+
+  int localAppLen = locLen - g_cbBaselineText;
+  int remoteAppLen = cbRemote - g_cbBaselineText;
+
+  // Nothing new on disk to merge
+  if (remoteAppLen <= 0) { free(locBuf); return FALSE; }
+
+  const char *localApp = locBuf + g_cbBaselineText;
+  const char *remoteApp = remote + g_cbBaselineText;
+
+  // Avoid duplicate append if identical
+  if (localAppLen == remoteAppLen && memcmp(localApp, remoteApp, remoteAppLen) == 0) {
+    free(locBuf);
+    return TRUE; // already in sync
+  }
+
+  // Append remote changes to current document (optionally insert newline between)
+  SendMessage(hwndEdit, SCI_BEGINUNDOACTION, 0, 0);
+
+  if (localAppLen > 0) {
+    // Ensure separation if needed
+    int needNL = 0;
+    if (locLen > 0) {
+      char last = locBuf[locLen - 1];
+      if (last != '\n' && last != '\r') needNL = 1;
+    }
+    if (needNL) {
+      const char *nl = "\r\n";
+      SendMessage(hwndEdit, SCI_APPENDTEXT, 2, (LPARAM)nl);
+    }
+  }
+
+  SendMessage(hwndEdit, SCI_APPENDTEXT, remoteAppLen, (LPARAM)remoteApp);
+  SendMessage(hwndEdit, SCI_ENDUNDOACTION, 0, 0);
+
+  free(locBuf);
+
+  // Keep caret at end if it was at tail before
+  int iCurPos = (int)SendMessage(hwndEdit, SCI_GETCURRENTPOS, 0, 0);
+  int iAnchorPos = (int)SendMessage(hwndEdit, SCI_GETANCHOR, 0, 0);
+  BOOL bIsTail = (iCurPos == iAnchorPos) && (iCurPos == (int)SendMessage(hwndEdit, SCI_GETLENGTH, 0, 0));
+  if (bIsTail) {
+    EditJumpTo(hwndEdit, -1, 0);
+    EditEnsureSelectionVisible(hwndEdit);
+  }
+
+  // Clear any conflict markers after successful merge
+  ClearConflictIndicator();
+  return TRUE;
+}
+
 
 int       iDefaultCodePage;
 int       iDefaultCharSet;
@@ -1403,39 +1574,79 @@ LRESULT CALLBACK MainWndProc(HWND hwnd,UINT umsg,WPARAM wParam,LPARAM lParam)
 
 
       case WM_CHANGENOTIFY:
-          if (iFileWatchingMode == 1 || bModified || iEncoding != iOriginalEncoding)
+          // Bring to foreground when user attention is likely needed
+          if (iFileWatchingMode == 1 || bModified)
             SetForegroundWindow(hwnd);
 
           if (PathFileExists(szCurFile)) {
 
-            if ((iFileWatchingMode == 2 && !bModified && iEncoding == iOriginalEncoding) ||
-                 MsgBox(MBYESNO,IDS_FILECHANGENOTIFY) == IDYES) {
+            if (iFileWatchingMode == 2) {
+              // Auto-reload (aggressive) or try to auto-merge small changes
+              if (!bModified) {
+                int iCurPos     = (int)SendMessage(hwndEdit,SCI_GETCURRENTPOS,0,0);
+                int iAnchorPos  = (int)SendMessage(hwndEdit,SCI_GETANCHOR,0,0);
+                int iVisTopLine = (int)SendMessage(hwndEdit,SCI_GETFIRSTVISIBLELINE,0,0);
+                int iDocTopLine = (int)SendMessage(hwndEdit,SCI_DOCLINEFROMVISIBLE,(WPARAM)iVisTopLine,0);
+                int iXOffset    = (int)SendMessage(hwndEdit,SCI_GETXOFFSET,0,0);
+                BOOL bIsTail    = (iCurPos == iAnchorPos) && (iCurPos == SendMessage(hwndEdit,SCI_GETLENGTH,0,0));
 
-              int iCurPos     = (int)SendMessage(hwndEdit,SCI_GETCURRENTPOS,0,0);
-              int iAnchorPos  = (int)SendMessage(hwndEdit,SCI_GETANCHOR,0,0);
-              int iVisTopLine = (int)SendMessage(hwndEdit,SCI_GETFIRSTVISIBLELINE,0,0);
-              int iDocTopLine = (int)SendMessage(hwndEdit,SCI_DOCLINEFROMVISIBLE,(WPARAM)iVisTopLine,0);
-              int iXOffset    = (int)SendMessage(hwndEdit,SCI_GETXOFFSET,0,0);
-              BOOL bIsTail    = (iCurPos == iAnchorPos) && (iCurPos == SendMessage(hwndEdit,SCI_GETLENGTH,0,0));
-
-              iWeakSrcEncoding = iEncoding;
-              if (FileLoad(TRUE,FALSE,TRUE,FALSE,szCurFile)) {
-
-                if (bIsTail && iFileWatchingMode == 2) {
-                  EditJumpTo(hwndEdit,-1,0);
-                  EditEnsureSelectionVisible(hwndEdit);
+                iWeakSrcEncoding = iEncoding;
+                if (FileLoad(TRUE,FALSE,TRUE,FALSE,szCurFile)) {
+                  if (bIsTail) {
+                    EditJumpTo(hwndEdit,-1,0);
+                    EditEnsureSelectionVisible(hwndEdit);
+                  }
+                  else if (SendMessage(hwndEdit,SCI_GETLENGTH,0,0) >= 4) {
+                    char tch[5] = "";
+                    SendMessage(hwndEdit,SCI_GETTEXT,5,(LPARAM)tch);
+                    if (lstrcmpiA(tch,".LOG") != 0) {
+                      int iNewTopLine;
+                      SendMessage(hwndEdit,SCI_SETSEL,iAnchorPos,iCurPos);
+                      SendMessage(hwndEdit,SCI_ENSUREVISIBLE,(WPARAM)iDocTopLine,0);
+                      iNewTopLine = (int)SendMessage(hwndEdit,SCI_GETFIRSTVISIBLELINE,0,0);
+                      SendMessage(hwndEdit,SCI_LINESCROLL,0,(LPARAM)iVisTopLine - iNewTopLine);
+                      SendMessage(hwndEdit,SCI_SETXOFFSET,(WPARAM)iXOffset,0);
+                    }
+                  }
                 }
+              }
+              else if (bAggressiveAutoReload) {
+                // Try a simple append-only auto-merge; otherwise mark conflicts prominently
+                char *remoteBuf = NULL; int remoteLen = 0;
+                if (ReadWholeFileBytes(szCurFile, &remoteBuf, &remoteLen)) {
+                  if (!TryAutoMergeAppendsWithRemote(remoteBuf, remoteLen)) {
+                    ShowConflictIndicatorWithRemote(remoteBuf, remoteLen);
+                  }
+                  free(remoteBuf);
+                }
+              }
+            }
+            else {
+              if (MsgBox(MBYESNO,IDS_FILECHANGENOTIFY) == IDYES) {
+                int iCurPos     = (int)SendMessage(hwndEdit,SCI_GETCURRENTPOS,0,0);
+                int iAnchorPos  = (int)SendMessage(hwndEdit,SCI_GETANCHOR,0,0);
+                int iVisTopLine = (int)SendMessage(hwndEdit,SCI_GETFIRSTVISIBLELINE,0,0);
+                int iDocTopLine = (int)SendMessage(hwndEdit,SCI_DOCLINEFROMVISIBLE,(WPARAM)iVisTopLine,0);
+                int iXOffset    = (int)SendMessage(hwndEdit,SCI_GETXOFFSET,0,0);
+                BOOL bIsTail    = (iCurPos == iAnchorPos) && (iCurPos == SendMessage(hwndEdit,SCI_GETLENGTH,0,0));
 
-                else if (SendMessage(hwndEdit,SCI_GETLENGTH,0,0) >= 4) {
-                  char tch[5] = "";
-                  SendMessage(hwndEdit,SCI_GETTEXT,5,(LPARAM)tch);
-                  if (lstrcmpiA(tch,".LOG") != 0) {
-                    int iNewTopLine;
-                    SendMessage(hwndEdit,SCI_SETSEL,iAnchorPos,iCurPos);
-                    SendMessage(hwndEdit,SCI_ENSUREVISIBLE,(WPARAM)iDocTopLine,0);
-                    iNewTopLine = (int)SendMessage(hwndEdit,SCI_GETFIRSTVISIBLELINE,0,0);
-                    SendMessage(hwndEdit,SCI_LINESCROLL,0,(LPARAM)iVisTopLine - iNewTopLine);
-                    SendMessage(hwndEdit,SCI_SETXOFFSET,(WPARAM)iXOffset,0);
+                iWeakSrcEncoding = iEncoding;
+                if (FileLoad(TRUE,FALSE,TRUE,FALSE,szCurFile)) {
+                  if (bIsTail) {
+                    EditJumpTo(hwndEdit,-1,0);
+                    EditEnsureSelectionVisible(hwndEdit);
+                  }
+                  else if (SendMessage(hwndEdit,SCI_GETLENGTH,0,0) >= 4) {
+                    char tch[5] = "";
+                    SendMessage(hwndEdit,SCI_GETTEXT,5,(LPARAM)tch);
+                    if (lstrcmpiA(tch,".LOG") != 0) {
+                      int iNewTopLine;
+                      SendMessage(hwndEdit,SCI_SETSEL,iAnchorPos,iCurPos);
+                      SendMessage(hwndEdit,SCI_ENSUREVISIBLE,(WPARAM)iDocTopLine,0);
+                      iNewTopLine = (int)SendMessage(hwndEdit,SCI_GETFIRSTVISIBLELINE,0,0);
+                      SendMessage(hwndEdit,SCI_LINESCROLL,0,(LPARAM)iVisTopLine - iNewTopLine);
+                      SendMessage(hwndEdit,SCI_SETXOFFSET,(WPARAM)iXOffset,0);
+                    }
                   }
                 }
               }
@@ -5671,6 +5882,11 @@ void LoadSettings()
   bResetFileWatching = IniSectionGetInt(pIniSection,L"ResetFileWatching",1);
   if (bResetFileWatching) bResetFileWatching = 1;
 
+  bAggressiveAutoReload = IniSectionGetInt(pIniSection,L"AggressiveAutoReload",1);
+  if (bAggressiveAutoReload) bAggressiveAutoReload = 1;
+  bAutoMergeAppends = IniSectionGetInt(pIniSection,L"AutoMergeAppends",1);
+  if (bAutoMergeAppends) bAutoMergeAppends = 1;
+
   iEscFunction = IniSectionGetInt(pIniSection,L"EscFunction",0);
   iEscFunction = max(min(iEscFunction,2),0);
 
@@ -5883,6 +6099,8 @@ void SaveSettings(BOOL bSaveSettingsNow)
   IniSectionSetInt(pIniSection,L"SaveBeforeRunningTools",bSaveBeforeRunningTools);
   IniSectionSetInt(pIniSection,L"FileWatchingMode",iFileWatchingMode);
   IniSectionSetInt(pIniSection,L"ResetFileWatching",bResetFileWatching);
+  IniSectionSetInt(pIniSection,L"AggressiveAutoReload",bAggressiveAutoReload);
+  IniSectionSetInt(pIniSection,L"AutoMergeAppends",bAutoMergeAppends);
   IniSectionSetInt(pIniSection,L"EscFunction",iEscFunction);
   IniSectionSetInt(pIniSection,L"AlwaysOnTop",bAlwaysOnTop);
   IniSectionSetInt(pIniSection,L"MinimizeToTray",bMinimizeToTray);
@@ -6874,6 +7092,8 @@ BOOL FileLoad(BOOL bDontSave,BOOL bNew,BOOL bReload,BOOL bNoEncDetect,LPCWSTR lp
     if (bResetFileWatching)
       iFileWatchingMode = 0;
     InstallFileWatching(NULL);
+    CaptureBaselineFromEditor();
+    ClearConflictIndicator();
 
     return TRUE;
   }
@@ -6966,6 +7186,8 @@ BOOL FileLoad(BOOL bDontSave,BOOL bNew,BOOL bReload,BOOL bNoEncDetect,LPCWSTR lp
     if (!bReload && bResetFileWatching)
       iFileWatchingMode = 0;
     InstallFileWatching(szCurFile);
+    CaptureBaselineFromEditor();
+    ClearConflictIndicator();
 
     // the .LOG feature ...
     if (SendMessage(hwndEdit,SCI_GETLENGTH,0,0) >= 4) {
@@ -7115,6 +7337,8 @@ BOOL FileSave(BOOL bSaveAlways,BOOL bAsk,BOOL bSaveAs,BOOL bSaveCopy)
       if (bSaveAs && bResetFileWatching)
         iFileWatchingMode = 0;
       InstallFileWatching(szCurFile);
+      CaptureBaselineFromEditor();
+      ClearConflictIndicator();
     }
   }
 
